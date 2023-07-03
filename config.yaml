@@ -1,0 +1,29 @@
+ApiInfo:
+  # 第三方平台ApiKey
+  apiKey: "A8e0FPkqfm5oaKJ_YDBPI_ZYMWMyS8y5"
+
+StockInfo:
+  # 股市，例如北美股市
+  market: "XNYS"
+  # 股票名称，多个逗号分开，不指定则标识抓取本股市下的所有股票
+  ticker: "AAP"
+  # 开始日期
+  beginDate: "2023-02-01"
+  # 结束日期
+  endDate: "2023-02-01"
+  # 数据频率 例如5分钟、10分钟
+  multiplier: 5
+  # 数据频率单位
+  timespan: "minute"
+  # 股票所在时区 Asia/Shanghai
+  timeZone: "America/New_York"
+
+LogInfo:
+  # 日志文件路径
+  logFile: "log.txt"
+
+MongoInfo:
+  # MongoDB连接URL
+  mongoURL: "mongodb://127.0.0.1:27017"
+  # MongoDB数据库名称
+  mongoDB: "stock_data"
