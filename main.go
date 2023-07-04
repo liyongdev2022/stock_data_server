@@ -7,12 +7,17 @@ import (
 	polygon "github.com/polygon-io/client-go/rest"
 	"github.com/polygon-io/client-go/rest/models"
 	"github.com/spf13/viper"
+	"github.com/vito-go/mcache"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"log"
 	"os"
 	"stock_data_server/config"
+	"stock_data_server/db_model"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,9 +25,17 @@ var (
 	// Logger 日志对象
 	Logger *log.Logger
 	// GConfig 全局配置对象
-	GConfig   *config.Config
+	GConfig *config.Config
+	// AllTicker 股票切换
 	AllTicker []*models.Ticker
+	// 协程锁
+	wg sync.WaitGroup
 )
+
+type TickerDetailParams struct {
+	Date   time.Time `json:"date"`
+	Ticker string    `json:"ticker"`
+}
 
 // 初始化
 func init() {
@@ -100,9 +113,17 @@ func main() {
 
 // 获取指定交易所所有股票交易状态
 func getExchangeAllTickerActive(polygonClient *polygon.Client, mongoClient *mongo.Client) {
+	// market 类型
 	market := models.AssetStocks
+
+	// 声明时区
 	loc, _ := time.LoadLocation(GConfig.StockInfo.TimeZone)
+
+	// 股票切片
 	tickerArray := strings.Split(GConfig.StockInfo.Ticker, ",")
+
+	// 声明一个通道结构体进行传参
+	chParams := make(chan TickerDetailParams, 100)
 
 	beginDate, err := time.ParseInLocation("2006-01-02 15:04:05", GConfig.StockInfo.BeginDate+" 00:00:00", loc)
 	if err != nil {
@@ -149,6 +170,19 @@ func getExchangeAllTickerActive(polygonClient *polygon.Client, mongoClient *mong
 						AllTicker = append(AllTicker, &item)
 						if !item.Active {
 							// 没有开票的股票进行记录，保存到MongoDB中
+							err = saveTickerNoActiveByDate(item, mongoClient)
+							if err != nil {
+								Logger.Printf("save ticker no active by date err:%v", err)
+							}
+						} else {
+							wg.Add(1)
+							// 发送参数
+							chParams <- TickerDetailParams{
+								Date:   date,
+								Ticker: v,
+							}
+							// 开始调用协程，执行获取指定日期股票交易历史数据
+							go fetchTickerDetail(chParams, wg, polygonClient, mongoClient)
 						}
 					}
 				}
@@ -161,6 +195,19 @@ func getExchangeAllTickerActive(polygonClient *polygon.Client, mongoClient *mong
 				AllTicker = append(AllTicker, &item)
 				if !item.Active {
 					// 没有开票的股票进行记录，保存到MongoDB中
+					err = saveTickerNoActiveByDate(item, mongoClient)
+					if err != nil {
+						Logger.Printf("save ticker no active by date err:%v", err)
+					}
+				} else {
+					wg.Add(1)
+					// 发送参数
+					chParams <- TickerDetailParams{
+						Date:   date,
+						Ticker: item.Ticker,
+					}
+					// 开始调用协程，执行获取指定日期股票交易历史数据
+					go fetchTickerDetail(chParams, wg, polygonClient, mongoClient)
 				}
 			}
 		}
@@ -169,7 +216,137 @@ func getExchangeAllTickerActive(polygonClient *polygon.Client, mongoClient *mong
 		time.Sleep(1 * time.Second)
 
 	}
+	wg.Wait()
 
 	fmt.Println("all-ticker==>", len(AllTicker))
 
+}
+
+// 获取指定日期股票交易历史数据
+func fetchTickerDetail(ch chan TickerDetailParams, wg sync.WaitGroup, polygonClient *polygon.Client, mongoClient *mongo.Client) {
+	defer wg.Done()
+
+	chParams := <-ch
+	// 先获取本地文件缓存标记，判断指定日期股票的数据是否抓取完整
+	key := GConfig.StockInfo.Market + "_" + chParams.Date.Format("20060102")
+	name := "stock_data_" + strconv.Itoa(GConfig.StockInfo.Multiplier) + "min"
+	preFlag, errs := getLocalCache(chParams.Ticker, key)
+	if errs != nil {
+		Logger.Printf("get local cache data err:%v", errs)
+	}
+	fmt.Println("preFlag===>", preFlag)
+	var flag bool
+	if preFlag == "0" {
+		// 抓取数据未完整，删除已存在历史数据
+		errs = delTickerHistoryDataBydDate(chParams.Ticker, name, chParams.Date, mongoClient)
+		if errs != nil {
+			Logger.Printf("delete ticker history data err:%v", errs)
+			return
+		}
+		// 重新抓取
+		flag = true
+
+	} else if preFlag == "" {
+		// 首次抓取
+		flag = true
+	}
+
+	// 首次抓取/重新抓取
+	if flag {
+		params := models.ListAggsParams{
+			Ticker:     chParams.Ticker,
+			From:       models.Millis(chParams.Date),
+			To:         models.Millis(chParams.Date),
+			Multiplier: GConfig.StockInfo.Multiplier,
+			Timespan:   models.Timespan(GConfig.StockInfo.Timespan),
+		}.WithOrder(models.Asc).WithLimit(5000)
+
+		iterResult := polygonClient.ListAggs(context.TODO(), params)
+
+		fmt.Printf("list aggs====>%+v\n", iterResult)
+		if iterResult.Err() != nil {
+			// 更新本地文件缓存标记, 请求报错
+			setLocalCache(chParams.Ticker, key, "-1")
+		}
+
+		var err error
+		for iterResult.Next() {
+			fmt.Println("-------")
+			err = saveTickerHistoryDataByDate(models.Agg(iterResult.Item()), chParams.Date, mongoClient)
+			if err != nil {
+				break
+			}
+		}
+		if err != nil {
+			// 更新本地文件缓存标记, 未完成
+			setLocalCache(chParams.Ticker, key, "0")
+		} else {
+			// 更新本地文件缓存标记, 已完成
+			setLocalCache(chParams.Ticker, key, "1")
+		}
+	}
+
+}
+
+// 保存指定日期股票未开盘信息
+func saveTickerNoActiveByDate(model models.Ticker, mongoClient *mongo.Client) error {
+	item := db_model.TickerStruct{
+		Ticker:          model.Ticker,
+		CompanyName:     model.Name,
+		PrimaryExchange: model.PrimaryExchange,
+		Active:          model.Active,
+		LastUpdatedUtc:  time.Time(model.LastUpdatedUTC),
+		CurrencyName:    model.CurrencyName,
+		Locale:          model.Locale,
+		Cik:             model.CIK,
+		CompositeFiGi:   model.CompositeFIGI,
+		ShareClassFiGi:  model.ShareClassFIGI,
+	}
+	_, err := mongoClient.Database(GConfig.MongoInfo.MongoDB).Collection("stock_tickers_history").InsertOne(context.TODO(), item)
+	return err
+}
+
+// 保存指定日期股票历史交易数据
+func saveTickerHistoryDataByDate(model models.Agg, date time.Time, mongoClient *mongo.Client) error {
+	item := db_model.StockDataDetail{
+		Ticker:         model.Ticker,
+		TimeStamp:      time.Time(model.Timestamp),
+		Open:           model.Open,
+		High:           model.High,
+		Low:            model.Low,
+		Close:          model.Close,
+		Volume:         model.Volume,
+		VolumeWeighted: model.VWAP,
+		TradeDate:      date,
+	}
+	name := "stock_data_" + strconv.Itoa(GConfig.StockInfo.Multiplier) + "min"
+	_, err := mongoClient.Database(GConfig.MongoInfo.MongoDB).Collection(name).InsertOne(context.TODO(), item)
+	return err
+}
+
+// 删除指定日期股票历史交易数据
+func delTickerHistoryDataBydDate(ticker string, collectionName string, date time.Time, mongoClient *mongo.Client) error {
+	c := mongoClient.Database(GConfig.MongoInfo.MongoDB).Collection(collectionName)
+	_, err := c.DeleteMany(context.TODO(), bson.D{{"ticker", ticker}, {"trade_date", date.Format("2006-01-02")}})
+	return err
+}
+
+// 设置本地缓存
+func setLocalCache(ticker string, key string, value string) error {
+	c, err := mcache.NewMcache(ticker)
+	if err != nil {
+		return err
+	}
+	err = c.Set(key, []byte(value))
+	return err
+
+}
+
+// 获取本地缓存
+func getLocalCache(ticker string, key string) (string, error) {
+	c, err := mcache.NewMcache(ticker)
+	if err != nil {
+		return "", err
+	}
+	return string(c.Get(key)), nil
 }

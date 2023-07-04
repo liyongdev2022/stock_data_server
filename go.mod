@@ -6,6 +6,7 @@ require (
 	github.com/go-co-op/gocron v1.30.1
 	github.com/polygon-io/client-go v1.13.1
 	github.com/spf13/viper v1.16.0
+	github.com/vito-go/mcache v0.0.0-20220307031111-23d26ccc6849
 	go.mongodb.org/mongo-driver v1.12.0
 )
 
