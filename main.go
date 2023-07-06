@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"github.com/go-co-op/gocron"
 	polygon "github.com/polygon-io/client-go/rest"
@@ -9,9 +10,11 @@ import (
 	"github.com/spf13/viper"
 	"github.com/vito-go/mcache"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"log"
+	"math"
 	"os"
 	"stock_data_server/config"
 	"stock_data_server/db_model"
@@ -117,7 +120,11 @@ func getExchangeAllTickerActive(polygonClient *polygon.Client, mongoClient *mong
 	market := models.AssetStocks
 
 	// 声明时区
-	loc, _ := time.LoadLocation(GConfig.StockInfo.TimeZone)
+	loc, err := time.LoadLocation(GConfig.StockInfo.TimeZone)
+	if err != nil {
+		Logger.Printf("time loadLocation timeZone err:%v", err)
+		return
+	}
 
 	// 股票切片
 	tickerArray := strings.Split(GConfig.StockInfo.Ticker, ",")
@@ -125,12 +132,12 @@ func getExchangeAllTickerActive(polygonClient *polygon.Client, mongoClient *mong
 	// 声明一个通道结构体进行传参
 	chParams := make(chan TickerDetailParams, 100)
 
-	beginDate, err := time.ParseInLocation("2006-01-02 15:04:05", GConfig.StockInfo.BeginDate+" 00:00:00", loc)
+	beginDate, err := time.Parse("2006-01-02 15:04:05", GConfig.StockInfo.BeginDate+" 00:00:00")
 	if err != nil {
 		Logger.Printf("beginDate time parse err:%v", err)
 		return
 	}
-	endDate, err := time.ParseInLocation("2006-01-02 15:04:05", GConfig.StockInfo.EndDate+" 00:00:00", loc)
+	endDate, err := time.Parse("2006-01-02 15:04:05", GConfig.StockInfo.EndDate+" 00:00:00")
 	if err != nil {
 		Logger.Printf("endDate time parse err:%v", err)
 		return
@@ -226,15 +233,22 @@ func getExchangeAllTickerActive(polygonClient *polygon.Client, mongoClient *mong
 func fetchTickerDetail(ch chan TickerDetailParams, wg sync.WaitGroup, polygonClient *polygon.Client, mongoClient *mongo.Client) {
 	defer wg.Done()
 
+	// 获取通道参数
 	chParams := <-ch
+
 	// 先获取本地文件缓存标记，判断指定日期股票的数据是否抓取完整
 	key := GConfig.StockInfo.Market + "_" + chParams.Date.Format("20060102")
+
+	// MongoDB集合名
 	name := "stock_data_" + strconv.Itoa(GConfig.StockInfo.Multiplier) + "min"
+
+	// 获取本地文件缓存标记
 	preFlag, errs := getLocalCache(chParams.Ticker, key)
 	if errs != nil {
 		Logger.Printf("get local cache data err:%v", errs)
 	}
-	fmt.Println("preFlag===>", preFlag)
+
+	var err error
 	var flag bool
 	if preFlag == "0" {
 		// 抓取数据未完整，删除已存在历史数据
@@ -253,27 +267,29 @@ func fetchTickerDetail(ch chan TickerDetailParams, wg sync.WaitGroup, polygonCli
 
 	// 首次抓取/重新抓取
 	if flag {
+
+		// 构造请求参数
 		params := models.ListAggsParams{
 			Ticker:     chParams.Ticker,
-			From:       models.Millis(chParams.Date),
-			To:         models.Millis(chParams.Date),
+			From:       models.Millis(time.UnixMilli(chParams.Date.UnixMilli() - 8*60*60*1000)),
+			To:         models.Millis(time.UnixMilli(chParams.Date.UnixMilli() - 8*60*60*1000)),
 			Multiplier: GConfig.StockInfo.Multiplier,
 			Timespan:   models.Timespan(GConfig.StockInfo.Timespan),
 		}.WithOrder(models.Asc).WithLimit(5000)
 
+		// 开始请求股票API接口
 		iterResult := polygonClient.ListAggs(context.TODO(), params)
 
-		fmt.Printf("list aggs====>%+v\n", iterResult)
 		if iterResult.Err() != nil {
 			// 更新本地文件缓存标记, 请求报错
 			setLocalCache(chParams.Ticker, key, "-1")
 		}
 
-		var err error
 		for iterResult.Next() {
-			fmt.Println("-------")
-			err = saveTickerHistoryDataByDate(models.Agg(iterResult.Item()), chParams.Date, mongoClient)
+			fmt.Println("---------------------------------------------------------------------")
+			err = saveTickerHistoryDataByDate(models.Agg(iterResult.Item()), chParams.Ticker, mongoClient)
 			if err != nil {
+				Logger.Printf("save ticker history data err:%v", err)
 				break
 			}
 		}
@@ -302,25 +318,32 @@ func saveTickerNoActiveByDate(model models.Ticker, mongoClient *mongo.Client) er
 		CompositeFiGi:   model.CompositeFIGI,
 		ShareClassFiGi:  model.ShareClassFIGI,
 	}
-	_, err := mongoClient.Database(GConfig.MongoInfo.MongoDB).Collection("stock_tickers_history").InsertOne(context.TODO(), item)
+	collection := mongoClient.Database(GConfig.MongoInfo.MongoDB).Collection("stock_tickers_history")
+	_, err := collection.InsertOne(context.TODO(), item)
 	return err
 }
 
 // 保存指定日期股票历史交易数据
-func saveTickerHistoryDataByDate(model models.Agg, date time.Time, mongoClient *mongo.Client) error {
+func saveTickerHistoryDataByDate(model models.Agg, ticker string, mongoClient *mongo.Client) error {
+
+	vwap, err := ConvertToDecimal128(model.VWAP)
+	if err != nil {
+		return err
+	}
 	item := db_model.StockDataDetail{
-		Ticker:         model.Ticker,
-		TimeStamp:      time.Time(model.Timestamp),
+		Ticker:         ticker,
+		TimeStamp:      primitive.Timestamp{T: uint32(time.Time(model.Timestamp).Unix()), I: 0},
 		Open:           model.Open,
 		High:           model.High,
 		Low:            model.Low,
 		Close:          model.Close,
 		Volume:         model.Volume,
-		VolumeWeighted: model.VWAP,
-		TradeDate:      date,
+		VolumeWeighted: vwap,
+		TradeDate:      primitive.NewDateTimeFromTime(time.Time(model.Timestamp)), // 不确定是不是需要转换一下时区？
 	}
 	name := "stock_data_" + strconv.Itoa(GConfig.StockInfo.Multiplier) + "min"
-	_, err := mongoClient.Database(GConfig.MongoInfo.MongoDB).Collection(name).InsertOne(context.TODO(), item)
+	collection := mongoClient.Database(GConfig.MongoInfo.MongoDB).Collection(name)
+	_, err = collection.InsertOne(context.TODO(), item)
 	return err
 }
 
@@ -349,4 +372,28 @@ func getLocalCache(ticker string, key string) (string, error) {
 		return "", err
 	}
 	return string(c.Get(key)), nil
+}
+
+//Float64ToByte Float64转byte
+func Float64ToByte(float float64) []byte {
+	bits := math.Float64bits(float)
+	bytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(bytes, bits)
+	return bytes
+}
+
+//ByteToFloat64 byte转Float64
+func ByteToFloat64(bytes []byte) float64 {
+	bits := binary.LittleEndian.Uint64(bytes)
+	return math.Float64frombits(bits)
+}
+
+func ConvertToDecimal128(value float64) (primitive.Decimal128, error) {
+	stringValue := strconv.FormatFloat(value, 'f', -1, 64)
+	decimalValue, err := primitive.ParseDecimal128(stringValue)
+	if err != nil {
+		return primitive.Decimal128{}, err
+	}
+
+	return decimalValue, nil
 }
