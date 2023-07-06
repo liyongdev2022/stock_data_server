@@ -8,7 +8,7 @@ import (
 	polygon "github.com/polygon-io/client-go/rest"
 	"github.com/polygon-io/client-go/rest/models"
 	"github.com/spf13/viper"
-	"github.com/vito-go/mcache"
+	"github.com/thedevsaddam/snapshot"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -33,6 +33,8 @@ var (
 	AllTicker []*models.Ticker
 	// 协程锁
 	wg sync.WaitGroup
+	// 读写锁
+	lock sync.RWMutex
 )
 
 type TickerDetailParams struct {
@@ -130,7 +132,7 @@ func getExchangeAllTickerActive(polygonClient *polygon.Client, mongoClient *mong
 	tickerArray := strings.Split(GConfig.StockInfo.Ticker, ",")
 
 	// 声明一个通道结构体进行传参
-	chParams := make(chan TickerDetailParams, 100)
+	chParams := make(chan TickerDetailParams, 1000)
 
 	beginDate, err := time.Parse("2006-01-02 15:04:05", GConfig.StockInfo.BeginDate+" 00:00:00")
 	if err != nil {
@@ -225,7 +227,7 @@ func getExchangeAllTickerActive(polygonClient *polygon.Client, mongoClient *mong
 	}
 	wg.Wait()
 
-	fmt.Println("all-ticker==>", len(AllTicker))
+	Logger.Println("fetch all ticker history trade data finish......")
 
 }
 
@@ -243,6 +245,8 @@ func fetchTickerDetail(ch chan TickerDetailParams, wg sync.WaitGroup, polygonCli
 	name := "stock_data_" + strconv.Itoa(GConfig.StockInfo.Multiplier) + "min"
 
 	// 获取本地文件缓存标记
+	lock.Lock()
+	defer lock.Unlock()
 	preFlag, errs := getLocalCache(chParams.Ticker, key)
 	if errs != nil {
 		Logger.Printf("get local cache data err:%v", errs)
@@ -267,7 +271,6 @@ func fetchTickerDetail(ch chan TickerDetailParams, wg sync.WaitGroup, polygonCli
 
 	// 首次抓取/重新抓取
 	if flag {
-
 		// 构造请求参数
 		params := models.ListAggsParams{
 			Ticker:     chParams.Ticker,
@@ -356,25 +359,29 @@ func delTickerHistoryDataBydDate(ticker string, collectionName string, date time
 
 // 设置本地缓存
 func setLocalCache(ticker string, key string, value string) error {
-	c, err := mcache.NewMcache(ticker)
+	c, err := snapshot.New(ticker)
 	if err != nil {
 		return err
 	}
-	err = c.Set(key, []byte(value))
+	err = c.Put(key, value)
 	return err
 
 }
 
 // 获取本地缓存
 func getLocalCache(ticker string, key string) (string, error) {
-	c, err := mcache.NewMcache(ticker)
+	c, err := snapshot.New(ticker)
 	if err != nil {
 		return "", err
 	}
-	return string(c.Get(key)), nil
+	var value string
+	if err = c.Get(key, &value); err != nil {
+		return "", err
+	}
+	return value, nil
 }
 
-//Float64ToByte Float64转byte
+// Float64ToByte Float64转byte
 func Float64ToByte(float float64) []byte {
 	bits := math.Float64bits(float)
 	bytes := make([]byte, 8)
@@ -382,12 +389,13 @@ func Float64ToByte(float float64) []byte {
 	return bytes
 }
 
-//ByteToFloat64 byte转Float64
+// ByteToFloat64 byte转Float64
 func ByteToFloat64(bytes []byte) float64 {
 	bits := binary.LittleEndian.Uint64(bytes)
 	return math.Float64frombits(bits)
 }
 
+// ConvertToDecimal128  float64转primitive.Decimal128
 func ConvertToDecimal128(value float64) (primitive.Decimal128, error) {
 	stringValue := strconv.FormatFloat(value, 'f', -1, 64)
 	decimalValue, err := primitive.ParseDecimal128(stringValue)

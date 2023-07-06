@@ -5,8 +5,8 @@ go 1.18
 require (
 	github.com/go-co-op/gocron v1.30.1
 	github.com/polygon-io/client-go v1.13.1
-	github.com/shopspring/decimal v1.3.1
 	github.com/spf13/viper v1.16.0
+	github.com/thedevsaddam/snapshot v0.0.0-20171008163313-97c0035e01e4
 	github.com/vito-go/mcache v0.0.0-20220307031111-23d26ccc6849
 	go.mongodb.org/mongo-driver v1.12.0
 )
