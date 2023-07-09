@@ -41,6 +41,11 @@ type TickerDetailParams struct {
 	Date   time.Time `json:"date"`
 	Ticker string    `json:"ticker"`
 }
+type LocalCacheData struct {
+	OperationTime string `json:"operationTime"`
+	IsFinish      int    `json:"isFinish"`
+	FinishTime    string `json:"finishTime"`
+}
 
 // 初始化
 func init() {
@@ -191,6 +196,7 @@ func getExchangeAllTickerActive(polygonClient *polygon.Client, mongoClient *mong
 								Ticker: v,
 							}
 							// 开始调用协程，执行获取指定日期股票交易历史数据
+							fmt.Println("date===>", date.Format("2006-01-02"))
 							go fetchTickerDetail(chParams, wg, polygonClient, mongoClient)
 						}
 					}
@@ -216,6 +222,7 @@ func getExchangeAllTickerActive(polygonClient *polygon.Client, mongoClient *mong
 						Ticker: item.Ticker,
 					}
 					// 开始调用协程，执行获取指定日期股票交易历史数据
+					fmt.Println("date===>", date.Format("2006-01-02"))
 					go fetchTickerDetail(chParams, wg, polygonClient, mongoClient)
 				}
 			}
@@ -238,35 +245,39 @@ func fetchTickerDetail(ch chan TickerDetailParams, wg sync.WaitGroup, polygonCli
 	// 获取通道参数
 	chParams := <-ch
 
-	// 先获取本地文件缓存标记，判断指定日期股票的数据是否抓取完整
-	key := GConfig.StockInfo.Market + "_" + chParams.Date.Format("20060102")
+	// 获取本地文件缓存标记
+	lock.Lock()
+	defer lock.Unlock()
 
 	// MongoDB集合名
 	name := "stock_data_" + strconv.Itoa(GConfig.StockInfo.Multiplier) + "min"
 
-	// 获取本地文件缓存标记
-	lock.Lock()
-	defer lock.Unlock()
-	preFlag, errs := getLocalCache(chParams.Ticker, key)
-	if errs != nil {
+	// 先获取本地文件缓存标记，判断指定日期股票的数据是否抓取完整
+	key := chParams.Ticker + "_" + chParams.Date.Format("20060102")
+
+	preFlag, errs := getLocalCache(GConfig.StockInfo.Market, key)
+	if errs != nil && !strings.Contains(errs.Error(), "does not exist!") {
 		Logger.Printf("get local cache data err:%v", errs)
 	}
 
 	var err error
 	var flag bool
-	if preFlag == "0" {
+
+	if preFlag != nil && preFlag.IsFinish == 0 {
 		// 抓取数据未完整，删除已存在历史数据
 		errs = delTickerHistoryDataBydDate(chParams.Ticker, name, chParams.Date, mongoClient)
 		if errs != nil {
 			Logger.Printf("delete ticker history data err:%v", errs)
-			return
+		} else {
+			// 重新抓取
+			flag = true
 		}
-		// 重新抓取
+	} else if preFlag == nil {
 		flag = true
-
-	} else if preFlag == "" {
-		// 首次抓取
-		flag = true
+		cacheValue := LocalCacheData{OperationTime: time.Now().Format("2006-01-02 15:04:05"), IsFinish: 0, FinishTime: ""}
+		if err = setLocalCache(GConfig.StockInfo.Market, key, &cacheValue); err != nil {
+			Logger.Printf("set local cache data err:%v", err)
+		}
 	}
 
 	// 首次抓取/重新抓取
@@ -282,10 +293,9 @@ func fetchTickerDetail(ch chan TickerDetailParams, wg sync.WaitGroup, polygonCli
 
 		// 开始请求股票API接口
 		iterResult := polygonClient.ListAggs(context.TODO(), params)
-
 		if iterResult.Err() != nil {
-			// 更新本地文件缓存标记, 请求报错
-			setLocalCache(chParams.Ticker, key, "-1")
+			Logger.Printf("get polygon list Aggs data err:%v", iterResult.Err())
+			return
 		}
 
 		for iterResult.Next() {
@@ -296,12 +306,25 @@ func fetchTickerDetail(ch chan TickerDetailParams, wg sync.WaitGroup, polygonCli
 				break
 			}
 		}
+
+		locCacheInfo, errors := getLocalCache(GConfig.StockInfo.Market, key)
+		if errors != nil {
+			Logger.Printf("get local cache data err:%v", errors)
+		}
+
 		if err != nil {
 			// 更新本地文件缓存标记, 未完成
-			setLocalCache(chParams.Ticker, key, "0")
+			locCacheInfo.IsFinish = 0
+			if err = setLocalCache(GConfig.StockInfo.Market, key, locCacheInfo); err != nil {
+				Logger.Printf("set local cache data err:%v", err)
+			}
 		} else {
 			// 更新本地文件缓存标记, 已完成
-			setLocalCache(chParams.Ticker, key, "1")
+			locCacheInfo.IsFinish = 1
+			locCacheInfo.FinishTime = time.Now().Format("2006-01-02 15:04:05")
+			if err = setLocalCache(GConfig.StockInfo.Market, key, locCacheInfo); err != nil {
+				Logger.Printf("set local cache data err:%v", err)
+			}
 		}
 	}
 
@@ -358,7 +381,7 @@ func delTickerHistoryDataBydDate(ticker string, collectionName string, date time
 }
 
 // 设置本地缓存
-func setLocalCache(ticker string, key string, value string) error {
+func setLocalCache(ticker string, key string, value *LocalCacheData) error {
 	c, err := snapshot.New(ticker)
 	if err != nil {
 		return err
@@ -369,16 +392,16 @@ func setLocalCache(ticker string, key string, value string) error {
 }
 
 // 获取本地缓存
-func getLocalCache(ticker string, key string) (string, error) {
+func getLocalCache(ticker string, key string) (*LocalCacheData, error) {
 	c, err := snapshot.New(ticker)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	var value string
+	var value LocalCacheData
 	if err = c.Get(key, &value); err != nil {
-		return "", err
+		return nil, err
 	}
-	return value, nil
+	return &value, nil
 }
 
 // Float64ToByte Float64转byte
